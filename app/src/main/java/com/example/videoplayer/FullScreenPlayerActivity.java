@@ -6,12 +6,11 @@ import java.util.regex.Pattern;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.Date;
 import java.util.List;
-import java.text.SimpleDateFormat;
+import java.util.HashMap;
+import java.util.Map;
 import java.net.HttpURLConnection;
 import java.net.URL;
-import java.net.URLDecoder;
 import java.io.BufferedReader;
 import java.io.DataOutputStream;
 import java.io.File;
@@ -19,8 +18,6 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.InputStreamReader;
-import java.io.InputStream;
-import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 
 import android.Manifest;
@@ -40,6 +37,8 @@ import android.bluetooth.le.ScanResult;
 import android.bluetooth.le.ScanSettings;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.graphics.Matrix;
+import android.graphics.SurfaceTexture;
 import android.media.MediaScannerConnection;
 import android.net.ConnectivityManager;
 import android.net.Network;
@@ -51,11 +50,15 @@ import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
+import android.util.DisplayMetrics;
 import android.util.Log;
+import android.view.Surface;
+import android.view.TextureView;
 import android.view.View;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
+import android.widget.FrameLayout;
 import android.widget.Toast;
 
 import androidx.activity.result.ActivityResultLauncher;
@@ -69,10 +72,9 @@ import androidx.core.content.ContextCompat;
 import androidx.media3.common.MediaItem;
 import androidx.media3.common.PlaybackException;
 import androidx.media3.common.Player;
+import androidx.media3.common.VideoSize;
 import androidx.media3.common.util.UnstableApi;
 import androidx.media3.exoplayer.ExoPlayer;
-import androidx.media3.ui.AspectRatioFrameLayout;
-import androidx.media3.ui.PlayerView;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -80,80 +82,65 @@ import org.json.JSONObject;
 import java.util.UUID;
 
 /**
- * Full-screen player:
- *  - Polls server every 60s
- *  - If download_status == false → download videos into /sdcard/video_new,
- *    atomically swap into /sdcard/video, then POST status=true
- *  - Plays local MP4s in a loop with ExoPlayer
- *  - Sends online heartbeat every 60s
- *  - Connects via BLE (Nordic UART service) to ESP32 "ESP32_PLAYER_CTRL_BLE"
- *    and reacts to PLAY / PAUSE / NEXT commands.
- *  - Reads temperature lines from ESP32 and sends them to
- *    /device/{android_id}/temperature_update on the server.
- *  - On REED: OPEN (door open), reads counts, increments daily & monthly,
- *    and posts them to /daily_update and /monthly_update.
- *  - Auto-reconnects to ESP32 if BLE disconnects or scan fails.
+ * Video player using TextureView for rotation support.
+ * TextureView (unlike SurfaceView) properly supports rotation transforms.
  */
 @OptIn(markerClass = UnstableApi.class)
 @SuppressLint("MissingPermission")
-public class FullScreenPlayerActivity extends AppCompatActivity {
+public class FullScreenPlayerActivity extends AppCompatActivity implements TextureView.SurfaceTextureListener {
 
-    // ===== Server base & endpoints =====
+    private static final String TAG = "FullScreenPlayer";
     private static final String API_BASE = "http://34.248.112.237:8005";
 
-    private static String listDownloadsUrl(String androidId) {
-        return API_BASE + "/device/" + androidId + "/videos/downloads";
+    private static String listDownloadsUrl(String id) { return API_BASE + "/device/" + id + "/videos/downloads"; }
+    private static String readStatusUrl(String id) { return API_BASE + "/device/" + id + "/download_status"; }
+    private static String updateStatusUrl(String id) { return API_BASE + "/device/" + id + "/download_update"; }
+    private static String updateOnlineUrl(String id) { return API_BASE + "/device/" + id + "/online_update"; }
+    private static String updateTemperatureUrl(String id) { return API_BASE + "/device/" + id + "/temperature_update"; }
+    private static String countsUrl(String id) { return API_BASE + "/device/" + id + "/counts"; }
+    private static String dailyUpdateUrl(String id) { return API_BASE + "/device/" + id + "/daily_update"; }
+    private static String monthlyUpdateUrl(String id) { return API_BASE + "/device/" + id + "/monthly_update"; }
+
+    // Video metadata
+    private static class VideoMetadata {
+        String filename = "";
+        String videoName = "";
+        int rotation = 0;
+        String fitMode = "cover";
     }
 
-    private static String readStatusUrl(String androidId) {
-        return API_BASE + "/device/" + androidId + "/download_status";
-    }
-
-    private static String updateStatusUrl(String androidId) {
-        return API_BASE + "/device/" + androidId + "/download_update";
-    }
-
-    private static String updateOnlineUrl(String androidId) {
-        return API_BASE + "/device/" + androidId + "/online_update";
-    }
-
-    private static String updateTemperatureUrl(String androidId) {
-        return API_BASE + "/device/" + androidId + "/temperature_update";
-    }
+    // Metadata storage
+    private volatile Map<String, VideoMetadata> metadataByVideoName = new HashMap<>();
+    private volatile Map<String, VideoMetadata> metadataByFilename = new HashMap<>();
+    private int lastAppliedRotation = -9999;
+    private String lastAppliedFitMode = "";
+    private List<File> currentPlaylistFiles = new ArrayList<>();
 
     private volatile boolean isWorking = false;
-    private final Handler pollHandler = new Handler(Looper.getMainLooper());
-
-    // ADD THIS:
     private volatile boolean downloadInProgress = false;
 
-    private static String countsUrl(String androidId) {
-        return API_BASE + "/device/" + androidId + "/counts";
-    }
+    // Screen dimensions
+    private int screenWidth = 0;
+    private int screenHeight = 0;
 
-    private static String dailyUpdateUrl(String androidId) {
-        return API_BASE + "/device/" + androidId + "/daily_update";
-    }
+    // Video dimensions
+    private int videoWidth = 0;
+    private int videoHeight = 0;
 
-    private static String monthlyUpdateUrl(String androidId) {
-        return API_BASE + "/device/" + androidId + "/monthly_update";
-    }
+    // Rotation polling every 10 seconds
+    private static final long ROTATION_POLL_MS = 10_000L;
+    private final Handler rotationPollHandler = new Handler(Looper.getMainLooper());
+    private final Runnable rotationPollRunnable = new Runnable() {
+        @Override
+        public void run() {
+            pollRotationMetadata();
+            rotationPollHandler.postDelayed(this, ROTATION_POLL_MS);
+        }
+    };
 
-    // ===== Local storage =====
-    private static final String ROOT_DIR = "video";      // /sdcard/video
-    private static final String TEMP_DIR = "video_new";  // /sdcard/video_new
-    private static final int MAX_RETRIES = 5;
-
-    // ===== Polling (every 60 seconds) =====
+    // Video download polling every 60 seconds
     private static final long POLL_MS = 60_000L;
-
-    private PlayerView playerView;
-    private ExoPlayer player;
-    private final Handler ui = new Handler(Looper.getMainLooper());
-    private ActivityResultLauncher<String> legacyPermLauncher;
-
-
-
+    private final Handler pollHandler = new Handler(Looper.getMainLooper());
     private final Runnable pollRunnable = new Runnable() {
         @Override
         public void run() {
@@ -163,101 +150,113 @@ public class FullScreenPlayerActivity extends AppCompatActivity {
         }
     };
 
-    // ===== Bluetooth (ESP32 over BLE, Nordic UART Service) =====
+    private static final String ROOT_DIR = "video";
+    private static final String TEMP_DIR = "video_new";
+    private static final int MAX_RETRIES = 5;
+
+    // Views - using TextureView instead of PlayerView
+    private FrameLayout rootContainer;
+    private TextureView textureView;
+    private ExoPlayer player;
+    private Surface surface;
+    private final Handler ui = new Handler(Looper.getMainLooper());
+    private ActivityResultLauncher<String> legacyPermLauncher;
+
+    // BLE
     private static final String ESP32_DEVICE_NAME = "ESP32_PLAYER_CTRL_BLE";
     private static final int REQ_BT_PERMS = 2001;
-
-    private static final UUID NUS_SERVICE_UUID =
-            UUID.fromString("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
-    private static final UUID NUS_CHAR_RX_UUID =
-            UUID.fromString("6E400002-B5A3-F393-E0A9-E50E24DCCA9E"); // Android -> ESP32
-    private static final UUID NUS_CHAR_TX_UUID =
-            UUID.fromString("6E400003-B5A3-F393-E0A9-E50E24DCCA9E"); // ESP32 -> Android
-
-    private static final UUID CCCD_UUID =
-            UUID.fromString("00002902-0000-1000-8000-00805F9B34FB");
+    private static final UUID NUS_SERVICE_UUID = UUID.fromString("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
+    private static final UUID NUS_CHAR_RX_UUID = UUID.fromString("6E400002-B5A3-F393-E0A9-E50E24DCCA9E");
+    private static final UUID NUS_CHAR_TX_UUID = UUID.fromString("6E400003-B5A3-F393-E0A9-E50E24DCCA9E");
+    private static final UUID CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805F9B34FB");
 
     private BluetoothAdapter btAdapter;
     private BluetoothLeScanner bleScanner;
     private BluetoothGatt btGatt;
-    private BluetoothGattCharacteristic nusTxChar; // ESP32 -> Android
-    private BluetoothGattCharacteristic nusRxChar; // Android -> ESP32
-
+    private BluetoothGattCharacteristic nusTxChar, nusRxChar;
     private final Handler bleHandler = new Handler(Looper.getMainLooper());
-
     private volatile boolean btShouldReconnect = true;
     private volatile boolean bleScanning = false;
 
-    // Regex to extract first number from "Temperature: 23.45 °C"
     private static final Pattern TEMP_PATTERN = Pattern.compile("(-?\\d+(?:\\.\\d+)?)");
-
-    // Last temperature we got from ESP32
     private volatile Float lastTemperatureValue = null;
 
-    // Temperature POST timer (every 5 seconds)
     private final Handler tempHandler = new Handler(Looper.getMainLooper());
     private final long TEMP_POST_INTERVAL_MS = 5_000L;
-
     private final Runnable tempPostRunnable = new Runnable() {
         @Override
         public void run() {
-            Float temp = lastTemperatureValue;
-            if (temp != null) {
-                float currentTemp = temp; // snapshot
-                Log.d("BLE_DEBUG", "Timer sending temperature: " + currentTemp);
-                // send latest value to server every 5 seconds
-                sendTemperatureToServer(currentTemp);
-            } else {
-                Log.d("BLE_DEBUG", "Timer: no temperature yet, skipping.");
-            }
-
-            // schedule next run
+            if (lastTemperatureValue != null) sendTemperatureToServer(lastTemperatureValue);
             tempHandler.postDelayed(this, TEMP_POST_INTERVAL_MS);
         }
     };
-
-    // Small holder for counts
-    private static class DeviceCounts {
-        int daily;
-        int monthly;
-    }
-
-    // ===== Lifecycle =====
 
     @Override
     protected void onCreate(@Nullable Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-
         setContentView(R.layout.activity_fullscreen_player);
 
-        playerView = findViewById(R.id.playerView);
-        playerView.setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_ZOOM);
-        playerView.setUseController(false);
+        // Get screen dimensions
+        DisplayMetrics dm = new DisplayMetrics();
+        getWindowManager().getDefaultDisplay().getRealMetrics(dm);
+        screenWidth = dm.widthPixels;
+        screenHeight = dm.heightPixels;
+        Log.d(TAG, "Screen size: " + screenWidth + "x" + screenHeight);
+
+        // Find views
+        rootContainer = findViewById(R.id.rootContainer);
+        textureView = findViewById(R.id.textureView);
+        textureView.setSurfaceTextureListener(this);
+
         applyImmersive();
 
         Toast.makeText(this, "Android ID: " + getAndroidId(), Toast.LENGTH_LONG).show();
 
-        legacyPermLauncher = registerForActivityResult(
-                new ActivityResultContracts.RequestPermission(),
-                granted -> {
-                    if (granted) startEverything();
-                    else toast("Storage permission denied.");
-                }
-        );
+        legacyPermLauncher = registerForActivityResult(new ActivityResultContracts.RequestPermission(),
+                granted -> { if (granted) startEverything(); else toast("Storage permission denied."); });
 
         ensureAllFilesAccessThenStart();
 
-        // Start periodic temperature posting (every 5 seconds)
         tempHandler.postDelayed(tempPostRunnable, TEMP_POST_INTERVAL_MS);
+        rotationPollHandler.postDelayed(rotationPollRunnable, ROTATION_POLL_MS);
 
-        // Init Bluetooth + auto-connect (BLE)
         btAdapter = BluetoothAdapter.getDefaultAdapter();
-        if (btAdapter == null) {
-            toast("Bluetooth not supported on this device");
-        } else {
-            ensureBluetoothPermissionAndConnect();
+        if (btAdapter != null) ensureBluetoothPermissionAndConnect();
+    }
+
+    // ===== TextureView.SurfaceTextureListener =====
+
+    @Override
+    public void onSurfaceTextureAvailable(SurfaceTexture surfaceTexture, int width, int height) {
+        Log.d(TAG, "SurfaceTexture available: " + width + "x" + height);
+        surface = new Surface(surfaceTexture);
+        if (player != null) {
+            player.setVideoSurface(surface);
         }
+    }
+
+    @Override
+    public void onSurfaceTextureSizeChanged(SurfaceTexture surfaceTexture, int width, int height) {
+        Log.d(TAG, "SurfaceTexture size changed: " + width + "x" + height);
+    }
+
+    @Override
+    public boolean onSurfaceTextureDestroyed(SurfaceTexture surfaceTexture) {
+        Log.d(TAG, "SurfaceTexture destroyed");
+        if (player != null) {
+            player.setVideoSurface(null);
+        }
+        if (surface != null) {
+            surface.release();
+            surface = null;
+        }
+        return true;
+    }
+
+    @Override
+    public void onSurfaceTextureUpdated(SurfaceTexture surfaceTexture) {
+        // Called every frame - no logging needed
     }
 
     @Override
@@ -266,241 +265,311 @@ public class FullScreenPlayerActivity extends AppCompatActivity {
         applyImmersive();
         pollHandler.removeCallbacksAndMessages(null);
         pollHandler.postDelayed(pollRunnable, POLL_MS);
+        rotationPollHandler.removeCallbacksAndMessages(null);
+        rotationPollHandler.postDelayed(rotationPollRunnable, 1000);
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
         pollHandler.removeCallbacksAndMessages(null);
-
+        rotationPollHandler.removeCallbacksAndMessages(null);
+        tempHandler.removeCallbacksAndMessages(null);
         btShouldReconnect = false;
         stopBleScan();
-
-        if (btGatt != null) {
-            try {
-                btGatt.close();
-            } catch (Exception ignored) {
-            }
-            btGatt = null;
-        }
-
+        if (btGatt != null) { try { btGatt.close(); } catch (Exception ignored) {} }
         if (player != null) {
+            player.setVideoSurface(null);
             player.release();
             player = null;
         }
-
-        // Stop temperature timer
-        tempHandler.removeCallbacksAndMessages(null);
+        if (surface != null) {
+            surface.release();
+            surface = null;
+        }
     }
 
-    // ===== Permissions (storage) =====
+    // ===== ROTATION POLLING =====
+    private void pollRotationMetadata() {
+        new Thread(() -> {
+            try {
+                if (!isOnline()) return;
+                String urlStr = listDownloadsUrl(getAndroidId());
+                Log.d(TAG, "Polling rotation from: " + urlStr);
 
+                HttpURLConnection c = (HttpURLConnection) new URL(urlStr).openConnection();
+                c.setConnectTimeout(10_000);
+                c.setReadTimeout(10_000);
+                c.setRequestMethod("GET");
+                c.connect();
+
+                if (c.getResponseCode() / 100 != 2) { c.disconnect(); return; }
+
+                StringBuilder sb = new StringBuilder();
+                try (BufferedReader br = new BufferedReader(new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8))) {
+                    String line; while ((line = br.readLine()) != null) sb.append(line);
+                } finally { c.disconnect(); }
+
+                Map<String, VideoMetadata> byName = new HashMap<>();
+                Map<String, VideoMetadata> byFile = new HashMap<>();
+
+                JSONObject obj = new JSONObject(sb.toString());
+                JSONArray items = obj.optJSONArray("items");
+                if (items != null) {
+                    for (int i = 0; i < items.length(); i++) {
+                        JSONObject it = items.optJSONObject(i);
+                        if (it != null) {
+                            VideoMetadata vm = new VideoMetadata();
+                            vm.videoName = it.optString("video_name", "").trim();
+                            vm.filename = it.optString("filename", "").trim();
+                            vm.rotation = it.optInt("rotation", 0);
+                            vm.fitMode = it.optString("fit_mode", "cover");
+
+                            if (!vm.videoName.isEmpty()) byName.put(vm.videoName.toLowerCase(), vm);
+                            if (!vm.filename.isEmpty()) byFile.put(vm.filename.toLowerCase(), vm);
+                            Log.d(TAG, "Polled: " + vm.videoName + "/" + vm.filename + " rot=" + vm.rotation + " fit=" + vm.fitMode);
+                        }
+                    }
+                }
+
+                metadataByVideoName = byName;
+                metadataByFilename = byFile;
+                ui.post(this::applyRotationForCurrentVideo);
+            } catch (Exception e) {
+                Log.e(TAG, "Poll error: " + e.getMessage());
+            }
+        }).start();
+    }
+
+    private VideoMetadata getMetadataForFile(File file) {
+        if (file == null) return null;
+        String filename = file.getName().toLowerCase();
+
+        VideoMetadata vm = metadataByFilename.get(filename);
+        if (vm != null) return vm;
+
+        String base = filename.contains(".") ? filename.substring(0, filename.lastIndexOf('.')) : filename;
+        vm = metadataByVideoName.get(base);
+        if (vm != null) return vm;
+
+        for (Map.Entry<String, VideoMetadata> e : metadataByVideoName.entrySet()) {
+            if (filename.contains(e.getKey()) || e.getKey().contains(base)) return e.getValue();
+        }
+        for (Map.Entry<String, VideoMetadata> e : metadataByFilename.entrySet()) {
+            String k = e.getKey().replace(".mp4", "");
+            if (filename.contains(k) || k.contains(base)) return e.getValue();
+        }
+        return null;
+    }
+
+    private void applyRotationForCurrentVideo() {
+        if (player == null || currentPlaylistFiles.isEmpty()) return;
+        int idx = player.getCurrentMediaItemIndex();
+        if (idx < 0 || idx >= currentPlaylistFiles.size()) return;
+
+        File f = currentPlaylistFiles.get(idx);
+        VideoMetadata vm = getMetadataForFile(f);
+        int targetRotation = vm != null ? vm.rotation : 0;
+        String fitMode = vm != null ? vm.fitMode : "cover";
+
+        // Only apply if rotation or fit mode changed
+        if (targetRotation == lastAppliedRotation && fitMode.equals(lastAppliedFitMode)) {
+            Log.d(TAG, "Rotation unchanged (" + targetRotation + "°), skipping");
+            return;
+        }
+
+        Log.d(TAG, "ROTATION CHANGED: " + lastAppliedRotation + " -> " + targetRotation + "° fitMode=" + fitMode + " for " + f.getName());
+        lastAppliedRotation = targetRotation;
+        lastAppliedFitMode = fitMode;
+
+        applyTextureViewTransform(targetRotation, fitMode);
+        toast("Rotation: " + targetRotation + "°");
+    }
+
+    /**
+     * Apply rotation using TextureView's Matrix transform.
+     * This is the proper way to rotate video content.
+     */
+    private void applyTextureViewTransform(int rotation, String fitMode) {
+        if (textureView == null) return;
+
+        int viewWidth = textureView.getWidth();
+        int viewHeight = textureView.getHeight();
+
+        if (viewWidth == 0 || viewHeight == 0) {
+            Log.d(TAG, "TextureView not measured yet, retrying...");
+            textureView.post(() -> applyTextureViewTransform(rotation, fitMode));
+            return;
+        }
+
+        // Use video dimensions if known, otherwise use view dimensions
+        int vw = videoWidth > 0 ? videoWidth : viewWidth;
+        int vh = videoHeight > 0 ? videoHeight : viewHeight;
+
+        Log.d(TAG, "Applying transform: rotation=" + rotation + " fitMode=" + fitMode +
+                " view=" + viewWidth + "x" + viewHeight + " video=" + vw + "x" + vh);
+
+        Matrix matrix = new Matrix();
+
+        // Center of the view
+        float centerX = viewWidth / 2f;
+        float centerY = viewHeight / 2f;
+
+        // For 90/270 rotation, the video dimensions are swapped after rotation
+        boolean isRotated90or270 = (rotation == 90 || rotation == 270);
+
+        // Calculate scale based on fit mode
+        float scaleX, scaleY;
+
+        if (isRotated90or270) {
+            // After rotation, video width becomes height and vice versa
+            // So we compare rotated video dimensions to view dimensions
+            float rotatedVideoWidth = vh;  // video height becomes width after rotation
+            float rotatedVideoHeight = vw; // video width becomes height after rotation
+
+            if ("contain".equals(fitMode)) {
+                // Fit inside - show entire video, may have black bars
+                float scale = Math.min((float) viewWidth / rotatedVideoWidth, (float) viewHeight / rotatedVideoHeight);
+                scaleX = scale * vw / viewWidth;
+                scaleY = scale * vh / viewHeight;
+            } else if ("fill".equals(fitMode)) {
+                // Stretch to fill exactly (may distort aspect ratio)
+                scaleX = (float) viewHeight / vw;  // video width fills view height
+                scaleY = (float) viewWidth / vh;   // video height fills view width
+            } else {
+                // Cover (default) - fill screen, may crop
+                float scale = Math.max((float) viewWidth / rotatedVideoWidth, (float) viewHeight / rotatedVideoHeight);
+                scaleX = scale * vw / viewWidth;
+                scaleY = scale * vh / viewHeight;
+            }
+        } else {
+            // 0 or 180 rotation - no dimension swap
+            if ("contain".equals(fitMode)) {
+                float scale = Math.min((float) viewWidth / vw, (float) viewHeight / vh);
+                scaleX = scale * vw / viewWidth;
+                scaleY = scale * vh / viewHeight;
+            } else if ("fill".equals(fitMode)) {
+                // Stretch to fill exactly
+                scaleX = 1f;
+                scaleY = 1f;
+            } else {
+                // Cover
+                float scale = Math.max((float) viewWidth / vw, (float) viewHeight / vh);
+                scaleX = scale * vw / viewWidth;
+                scaleY = scale * vh / viewHeight;
+            }
+        }
+
+        // Apply transformations: scale first, then rotate around center
+        matrix.setScale(scaleX, scaleY, centerX, centerY);
+        matrix.postRotate(rotation, centerX, centerY);
+
+        textureView.setTransform(matrix);
+        Log.d(TAG, "Transform applied: rotation=" + rotation + " scaleX=" + scaleX + " scaleY=" + scaleY);
+    }
+
+    // ===== STORAGE =====
     private void ensureAllFilesAccessThenStart() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             if (!Environment.isExternalStorageManager()) {
                 try {
-                    Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
-                    intent.setData(Uri.parse("package:" + getPackageName()));
-                    startActivity(intent);
-                    toast("Grant 'All files access', then return here.");
+                    Intent i = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
+                    i.setData(Uri.parse("package:" + getPackageName()));
+                    startActivity(i);
                 } catch (Exception e) {
                     startActivity(new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
                 }
-            } else {
-                startEverything();
-            }
+            } else startEverything();
         } else {
-            if (ContextCompat.checkSelfPermission(this,
-                    Manifest.permission.WRITE_EXTERNAL_STORAGE)
-                    == PackageManager.PERMISSION_GRANTED) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED)
                 startEverything();
-            } else {
-                legacyPermLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE);
-            }
+            else legacyPermLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE);
         }
     }
-
-    // ===== Initial run =====
 
     private void startEverything() {
-        // ⛔ If already working OR a download is in progress, don't start again
         if (isWorking || downloadInProgress) return;
         isWorking = true;
-
         new Thread(() -> {
             try {
-                File mainDir = ensureMainDir();
-                File tmpDir = ensureTempDir();
-                final String androidId = getAndroidId();
+                File mainDir = ensureMainDir(), tmpDir = ensureTempDir();
+                String id = getAndroidId();
+                try { postOnlineTrue(updateOnlineUrl(id)); } catch (Exception ignored) {}
 
-                try {
-                    postOnlineTrue(updateOnlineUrl(androidId));
-                } catch (Exception ignored) {
-                }
+                if (!isOnline()) { ui.post(() -> toast("Offline")); playLocalPlaylistOrToast(mainDir); return; }
 
-                if (!isOnline()) {
-                    ui.post(() -> toast("Offline → playing local videos."));
-                    playLocalPlaylistOrToast(mainDir);
-                    return;
-                }
-
-                boolean status = readDownloadStatus(readStatusUrl(androidId));
-
-                // 🚩 Once we see false → mark downloadInProgress and DO NOT ask status again
-                if (!status) {
+                if (!readDownloadStatus(readStatusUrl(id))) {
                     downloadInProgress = true;
                     try {
                         deleteAllInDirectory(tmpDir);
-                        List<String> urls = fetchDownloadUrls(listDownloadsUrl(androidId));
-                        int ok = downloadAllWithResume(urls, tmpDir);
-                        if (ok == urls.size() && ok > 0) {
+                        List<String> urls = fetchDownloadUrls(listDownloadsUrl(id));
+                        if (downloadAllWithResume(urls, tmpDir) == urls.size() && !urls.isEmpty()) {
                             stopPlaybackForRefresh();
                             atomicSwapIntoMain(mainDir, tmpDir);
-                            postUpdateStatusTrue(updateStatusUrl(androidId));
+                            postUpdateStatusTrue(updateStatusUrl(id));
                         }
-                    } finally {
-                        // ✅ Download attempt finished (success or fail)
-                        downloadInProgress = false;
-                    }
+                    } finally { downloadInProgress = false; }
                 }
-
                 playLocalPlaylistOrToast(mainDir);
-            } catch (Exception e) {
-                ui.post(() -> toast("Init error: " + e.getMessage()));
-            } finally {
-                isWorking = false;
-            }
+                pollRotationMetadata();
+            } catch (Exception e) { ui.post(() -> toast("Error: " + e.getMessage())); }
+            finally { isWorking = false; }
         }).start();
     }
 
-
-    // ===== Periodic check =====
-
     private void startBackgroundCheckIfNeeded() {
-        // ⛔ If busy or currently downloading, don't do anything
         if (isWorking || downloadInProgress) return;
         isWorking = true;
-
         new Thread(() -> {
             try {
-                File mainDir = ensureMainDir();
-                File tmpDir = ensureTempDir();
-                final String androidId = getAndroidId();
-
+                File mainDir = ensureMainDir(), tmpDir = ensureTempDir();
                 if (!isOnline()) return;
-
-                // Double-check: if a download started meanwhile, bail
-                if (downloadInProgress) return;
-
-                boolean status = readDownloadStatus(readStatusUrl(androidId));
-
-                if (!status) {
+                String id = getAndroidId();
+                if (!readDownloadStatus(readStatusUrl(id))) {
                     downloadInProgress = true;
                     try {
                         deleteAllInDirectory(tmpDir);
-                        List<String> urls = fetchDownloadUrls(listDownloadsUrl(androidId));
-                        if (!urls.isEmpty()) {
-                            int ok = downloadAllWithResume(urls, tmpDir);
-                            if (ok == urls.size()) {
-                                stopPlaybackForRefresh();
-                                atomicSwapIntoMain(mainDir, tmpDir);
-                                postUpdateStatusTrue(updateStatusUrl(androidId));
-                                ui.post(() -> {
-                                    toast("Refreshed videos & set status=true");
-                                    playLocalPlaylistOrToast(mainDir);
-                                });
-                            }
+                        List<String> urls = fetchDownloadUrls(listDownloadsUrl(id));
+                        if (!urls.isEmpty() && downloadAllWithResume(urls, tmpDir) == urls.size()) {
+                            stopPlaybackForRefresh();
+                            atomicSwapIntoMain(mainDir, tmpDir);
+                            postUpdateStatusTrue(updateStatusUrl(id));
+                            ui.post(() -> { toast("Videos refreshed"); playLocalPlaylistOrToast(mainDir); });
                         }
-                    } finally {
-                        // ✅ Download attempt has finished
-                        downloadInProgress = false;
-                    }
+                    } finally { downloadInProgress = false; }
                 }
-            } catch (Exception ignored) {
-            } finally {
-                isWorking = false;
-            }
+            } catch (Exception ignored) {}
+            finally { isWorking = false; }
         }).start();
     }
-
-
-    // ===== Heartbeat =====
 
     private void sendOnlineHeartbeat() {
-        new Thread(() -> {
-            try {
-                String androidId = getAndroidId();
-                String url = updateOnlineUrl(androidId);
-                postOnlineTrue(url);
-            } catch (Exception ignored) {
-            }
-        }).start();
+        new Thread(() -> { try { postOnlineTrue(updateOnlineUrl(getAndroidId())); } catch (Exception ignored) {} }).start();
     }
 
-    private void postOnlineTrue(String urlStr) throws Exception {
-        HttpURLConnection c = (HttpURLConnection) new URL(urlStr).openConnection();
-        c.setConnectTimeout(20_000);
-        c.setReadTimeout(30_000);
-        c.setRequestMethod("POST");
-        c.setDoOutput(true);
+    private void postOnlineTrue(String url) throws Exception {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setConnectTimeout(20_000); c.setReadTimeout(30_000);
+        c.setRequestMethod("POST"); c.setDoOutput(true);
         c.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
-        c.setRequestProperty("Accept", "application/json");
-
-        String payload = "{\"is_online\": true}";
         try (DataOutputStream out = new DataOutputStream(c.getOutputStream())) {
-            out.write(payload.getBytes(StandardCharsets.UTF_8));
-            out.flush();
+            out.write("{\"is_online\": true}".getBytes(StandardCharsets.UTF_8));
         }
-
-        int code = c.getResponseCode();
-        if (code / 100 != 2) {
-            String msg = "Online update HTTP " + code + " " + c.getResponseMessage();
-            c.disconnect();
-            throw new RuntimeException(msg);
-        }
-        c.disconnect();
+        c.getResponseCode(); c.disconnect();
     }
 
-    // ===== Atomic swap: tmp -> main =====
-
-    private void atomicSwapIntoMain(File mainDir, File tmpDir) {
-        String ts = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
-        File backup = new File(mainDir.getParentFile(), ROOT_DIR + "_old_" + ts);
-
-        if (!backup.getParentFile().exists()) backup.getParentFile().mkdirs();
-
-        if (mainDir.exists() && mainDir.listFiles() != null
-                && mainDir.listFiles().length > 0) {
-            mainDir.renameTo(backup);
-        } else {
-            deleteAllInDirectory(mainDir);
-            mainDir.delete();
-        }
-
-        tmpDir.renameTo(mainDir);
-
-        new Thread(() -> {
-            try {
-                deleteAllInDirectory(backup);
-                backup.delete();
-            } catch (Exception ignored) {
-            }
-        }).start();
+    private void atomicSwapIntoMain(File main, File tmp) {
+        File backup = new File(main.getParent(), main.getName() + "_old");
+        try {
+            if (backup.exists()) { deleteAllInDirectory(backup); backup.delete(); }
+            if (main.exists()) main.renameTo(backup);
+            tmp.renameTo(main);
+            if (backup.exists()) { deleteAllInDirectory(backup); backup.delete(); }
+        } catch (Exception ignored) {}
     }
 
     private void stopPlaybackForRefresh() {
-        ui.post(() -> {
-            if (player != null) {
-                try {
-                    player.stop();
-                } catch (Exception ignored) {
-                }
-                try {
-                    player.clearMediaItems();
-                } catch (Exception ignored) {
-                }
-            }
-        });
+        ui.post(() -> { if (player != null) { player.stop(); player.clearMediaItems(); } });
     }
 
     private void deleteAllInDirectory(File dir) {
@@ -508,530 +577,229 @@ public class FullScreenPlayerActivity extends AppCompatActivity {
         File[] files = dir.listFiles();
         if (files == null) return;
         for (File f : files) {
-            try {
-                if (f.isDirectory()) {
-                    deleteAllInDirectory(f);
-                    f.delete();
-                } else {
-                    try {
-                        MediaScannerConnection.scanFile(
-                                this,
-                                new String[]{f.getAbsolutePath()},
-                                null,
-                                null
-                        );
-                    } catch (Exception ignored) {
-                    }
-                    f.delete();
-                }
-            } catch (Exception ignored) {
-            }
+            if (f.isDirectory()) { deleteAllInDirectory(f); f.delete(); }
+            else f.delete();
         }
     }
 
-    // ===== Connectivity =====
-
     private boolean isOnline() {
-        ConnectivityManager cm =
-                (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+        ConnectivityManager cm = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
         if (cm == null) return false;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             Network net = cm.getActiveNetwork();
             if (net == null) return false;
             NetworkCapabilities nc = cm.getNetworkCapabilities(net);
-            return nc != null &&
-                    nc.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
-        } else {
-            android.net.NetworkInfo ni = cm.getActiveNetworkInfo();
-            return ni != null && ni.isConnected();
+            return nc != null && nc.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
         }
+        android.net.NetworkInfo ni = cm.getActiveNetworkInfo();
+        return ni != null && ni.isConnected();
     }
 
-    // ===== Download logic =====
-
-    private int downloadAllWithResume(List<String> urls, File targetDir) {
-        if (urls == null) urls = new ArrayList<>();
-        final int total = urls.size();
-        if (total == 0) return 0;
-
-        ui.post(() -> toast("Downloading " + total + " video(s)…"));
-        int success = 0;
-        for (String u : urls) {
-            try {
-                File f = bigFileDownloadWithResume(u, targetDir);
-                if (f != null && f.exists() && f.length() > 0) {
-                    success++;
-                    MediaScannerConnection.scanFile(
-                            this,
-                            new String[]{f.getAbsolutePath()},
-                            new String[]{"video/mp4"},
-                            null
-                    );
-                }
-            } catch (Exception ignored) {
-            }
-        }
-        return success;
-    }
-
-    private File bigFileDownloadWithResume(String urlStr, File targetDir) throws Exception {
-
-        String baseName = filenameFromContentDispositionOrUrl(null, urlStr);
-        File partFile = new File(targetDir, baseName + ".part");
-        long downloaded = partFile.exists() ? partFile.length() : 0L;
-
-        String finalUrl = resolveRedirects(urlStr, null);
-        int attempts = 0;
-
-        Log.d("DOWNLOAD_FLOW", "Starting download: " + finalUrl +
-                " (already have " + downloaded + " bytes)");
-
-        while (attempts < MAX_RETRIES) {
-            attempts++;
-
-            HttpURLConnection c = (HttpURLConnection) new URL(finalUrl).openConnection();
-            c.setInstanceFollowRedirects(false);
-            c.setConnectTimeout(120_000);      // 120s connect timeout
-            c.setReadTimeout(120_000);         // ✅ 120s read timeout (no more 0)
-            c.setRequestMethod("GET");
-            c.setRequestProperty("User-Agent", "Android-VideoPlayer/1.0");
-            c.setRequestProperty("Accept", "*/*");
-            c.setRequestProperty("Accept-Encoding", "identity");
-            c.setRequestProperty("Connection", "keep-alive");
-
-            if (downloaded > 0) {
-                String range = "bytes=" + downloaded + "-";
-                Log.d("DOWNLOAD_FLOW", "Attempt " + attempts + " with Range: " + range);
-                c.setRequestProperty("Range", range);
-            } else {
-                Log.d("DOWNLOAD_FLOW", "Attempt " + attempts + " with full GET");
-            }
-
-            int code = c.getResponseCode();
-            int klass = code / 100;
-            Log.d("DOWNLOAD_FLOW", "HTTP " + code + " on attempt " + attempts);
-
-            if (klass == 2 || code == 206) {
-                String cd = c.getHeaderField("Content-Disposition");
-                String finalName = filenameFromContentDispositionOrUrl(cd, finalUrl);
-                File outFile = new File(targetDir, finalName);
-
-                if (code == 200 && downloaded > 0) {
-                    // server ignored Range → restart from scratch
-                    Log.w("DOWNLOAD_FLOW", "Server returned 200 for ranged request; restarting file");
-                    if (partFile.exists()) partFile.delete();
-                    downloaded = 0L;
-                }
-
-                try (InputStream in = c.getInputStream();
-                     FileOutputStream out =
-                             new FileOutputStream(partFile, downloaded > 0)) {
-
-                    byte[] buf = new byte[128 * 1024];
-                    int n;
-                    long totalWritten = downloaded;
-
-                    while ((n = in.read(buf)) != -1) {
-                        out.write(buf, 0, n);
-                        totalWritten += n;
-
-                        // optional: log occasionally
-                        if (totalWritten % (5 * 1024 * 1024) < buf.length) {
-                            Log.d("DOWNLOAD_FLOW", "Downloaded ~" + (totalWritten / (1024 * 1024)) + " MB");
-                        }
-                    }
-                    out.flush();
-                    Log.d("DOWNLOAD_FLOW", "Finished download, bytes=" + totalWritten);
-                } finally {
-                    c.disconnect();
-                }
-
-                if (outFile.exists()) outFile.delete();
-                if (!partFile.renameTo(outFile)) {
-                    Log.w("DOWNLOAD_FLOW", "renameTo failed; copying to final file");
-                    try (FileOutputStream out = new FileOutputStream(outFile);
-                         InputStream in = new FileInputStream(partFile)) {
-                        byte[] b = new byte[128 * 1024];
-                        int n;
-                        while ((n = in.read(b)) != -1) out.write(b, 0, n);
-                    }
-                    partFile.delete();
-                }
-
-                return outFile;
-            }
-
-            // Non-2xx
-            Log.w("DOWNLOAD_FLOW", "Non-2xx code: " + code + " msg=" + c.getResponseMessage());
-            c.disconnect();
-
-            // small backoff
-            Thread.sleep(1_500L * attempts);
-            downloaded = partFile.exists() ? partFile.length() : 0L;
-            Log.d("DOWNLOAD_FLOW", "Retrying, already have " + downloaded + " bytes");
-        }
-
-        throw new RuntimeException("Download failed after " + MAX_RETRIES + " attempts");
-    }
-
-
-    private String resolveRedirects(String start, URL base) throws Exception {
-        String current = start;
-        URL baseUrl = base;
-        for (int hop = 0; hop < 10; hop++) {
-            URL u = (baseUrl == null) ? new URL(current) : new URL(baseUrl, current);
-            HttpURLConnection c = (HttpURLConnection) u.openConnection();
-            c.setInstanceFollowRedirects(false);
-            c.setConnectTimeout(120_000);
-            c.setReadTimeout(30_000);
-            c.setRequestMethod("HEAD");
-            c.setRequestProperty("User-Agent", "Android-VideoPlayer/1.0");
-            c.setRequestProperty("Accept", "*/*");
-            c.setRequestProperty("Accept-Encoding", "identity");
-            c.connect();
-
-            int code = c.getResponseCode();
-            int klass = code / 100;
-            String location = c.getHeaderField("Location");
-            c.disconnect();
-
-            if (klass == 3 && location != null && !location.trim().isEmpty()) {
-                baseUrl = u;
-                current = location.trim();
-                continue;
-            }
-
-            if (code == HttpURLConnection.HTTP_BAD_METHOD
-                    || code == HttpURLConnection.HTTP_FORBIDDEN) {
-                HttpURLConnection g =
-                        (HttpURLConnection) u.openConnection();
-                g.setInstanceFollowRedirects(false);
-                g.setConnectTimeout(120_000);
-                g.setReadTimeout(30_000);
-                g.setRequestMethod("GET");
-                g.setRequestProperty("Range", "bytes=0-0");
-                g.setRequestProperty("User-Agent", "Android-VideoPlayer/1.0");
-                g.setRequestProperty("Accept", "*/*");
-                g.setRequestProperty("Accept-Encoding", "identity");
-                g.connect();
-                int gCode = g.getResponseCode();
-                String loc2 = g.getHeaderField("Location");
-                g.disconnect();
-                if ((gCode / 100) == 3 && loc2 != null && !loc2.trim().isEmpty()) {
-                    baseUrl = u;
-                    current = loc2.trim();
-                    continue;
-                }
-            }
-            return u.toString();
-        }
-        throw new RuntimeException("Too many redirects");
-    }
-
-    private String filenameFromContentDispositionOrUrl(String contentDisposition,
-                                                       String url) {
-        if (contentDisposition != null) {
-            String cd = contentDisposition;
-            int star = cd.toLowerCase().indexOf("filename*=");
-            if (star >= 0) {
-                String v = cd.substring(star + 10).trim();
-                v = stripSemicolon(v);
-                int twoTicks = v.indexOf("''");
-                if (twoTicks > 0 && twoTicks + 2 < v.length()) {
-                    String enc = v.substring(twoTicks + 2);
-                    try {
-                        String dec = URLDecoder.decode(stripQuotes(enc), "UTF-8");
-                        if (!dec.isEmpty()) return sanitizeFilename(dec);
-                    } catch (Exception ignored) {
-                    }
-                }
-            }
-            int idx = cd.toLowerCase().indexOf("filename=");
-            if (idx >= 0) {
-                String v = cd.substring(idx + 9).trim();
-                v = stripSemicolon(v);
-                v = stripQuotes(v);
-                if (!v.isEmpty()) return sanitizeFilename(v);
-            }
-        }
-        String path = url;
-        int q = path.indexOf('?');
-        if (q >= 0) path = path.substring(0, q);
-        int slash = path.lastIndexOf('/');
-        String last = (slash >= 0 && slash + 1 < path.length())
-                ? path.substring(slash + 1) : "download.bin";
-        if (last.isEmpty()) last = "download.bin";
-        return sanitizeFilename(last);
-    }
-
-    private String stripSemicolon(String s) {
-        int i = s.indexOf(';');
-        return (i >= 0) ? s.substring(0, i).trim() : s;
-    }
-
-    private String stripQuotes(String s) {
-        if ((s.startsWith("\"") && s.endsWith("\""))
-                || (s.startsWith("'") && s.endsWith("'"))) {
-            return s.substring(1, s.length() - 1);
-        }
-        return s;
-    }
-
-    private String sanitizeFilename(String s) {
-        return s.replaceAll("[\\\\/:*?\"<>|]", "_");
-    }
-
-    // ===== Playlist playback =====
-
-    private void playLocalPlaylistOrToast(File dir) {
-        List<File> files = listAllMp4SortedByName(dir);
-        if (files.isEmpty()) {
-            ui.post(() -> toast("No local videos found."));
-            return;
-        }
-        ui.post(() -> {
-            initPlayer();
-            List<MediaItem> items = new ArrayList<>();
-            for (File f : files) {
-                if (f.exists() && f.length() > 0) {
-                    items.add(MediaItem.fromUri(Uri.fromFile(f)));
-                }
-            }
-            if (items.isEmpty()) {
-                toast("No playable videos.");
-                return;
-            }
-            player.setMediaItems(items, true);
-            player.setRepeatMode(Player.REPEAT_MODE_ALL);
-            player.prepare();
-            player.play();
-        });
-    }
-
-    private List<File> listAllMp4SortedByName(File dir) {
-        File[] arr = dir.listFiles((d, name) ->
-                name.toLowerCase().endsWith(".mp4"));
-        if (arr == null || arr.length == 0) return new ArrayList<>();
-        List<File> files = new ArrayList<>();
-        Collections.addAll(files, arr);
-        files.sort(Comparator.comparing(f -> f.getName().toLowerCase()));
-        return files;
-    }
-
-    // ===== HTTP helpers for status & URLs =====
-
-    private boolean readDownloadStatus(String urlStr) throws Exception {
-        HttpURLConnection c = (HttpURLConnection) new URL(urlStr).openConnection();
-        c.setConnectTimeout(20_000);
-        c.setReadTimeout(30_000);
-        c.setRequestMethod("GET");
-        c.setRequestProperty("Accept", "application/json");
-        c.connect();
-
-        int code = c.getResponseCode();
-        if (code / 100 != 2) {
-            String msg = "Read status HTTP " + code + " "
-                    + c.getResponseMessage();
-            c.disconnect();
-            throw new RuntimeException(msg);
-        }
-
+    private List<String> fetchDownloadUrls(String url) throws Exception {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setConnectTimeout(20_000); c.setReadTimeout(30_000); c.setRequestMethod("GET"); c.connect();
+        if (c.getResponseCode() / 100 != 2) { c.disconnect(); throw new RuntimeException("HTTP error"); }
         StringBuilder sb = new StringBuilder();
-        try (BufferedReader br = new BufferedReader(
-                new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8))) {
-            String line;
-            while ((line = br.readLine()) != null) sb.append(line);
-        } finally {
-            c.disconnect();
-        }
-
-        JSONObject obj = new JSONObject(sb.toString());
-        if (obj.has("download_status")) {
-            return obj.optBoolean("download_status", false);
-        }
-        return obj.optBoolean("status", false);
-    }
-
-    private void postUpdateStatusTrue(String urlStr) throws Exception {
-        HttpURLConnection c = (HttpURLConnection) new URL(urlStr).openConnection();
-        c.setConnectTimeout(20_000);
-        c.setReadTimeout(30_000);
-        c.setRequestMethod("POST");
-        c.setDoOutput(true);
-        c.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
-        c.setRequestProperty("Accept", "application/json");
-
-        String payload = "{\"status\": true}";
-        try (DataOutputStream out = new DataOutputStream(c.getOutputStream())) {
-            out.write(payload.getBytes(StandardCharsets.UTF_8));
-            out.flush();
-        }
-
-        int code = c.getResponseCode();
-        if (code / 100 != 2) {
-            String msg = "POST update HTTP " + code + " "
-                    + c.getResponseMessage();
-            try (InputStream es = c.getErrorStream()) {
-                if (es != null) {
-                    BufferedReader br = new BufferedReader(
-                            new InputStreamReader(es, StandardCharsets.UTF_8));
-                    String line;
-                    StringBuilder err = new StringBuilder();
-                    while ((line = br.readLine()) != null) err.append(line);
-                    msg += " | " + err;
-                }
-            } catch (Exception ignored) {
-            }
-            c.disconnect();
-            throw new RuntimeException(msg);
-        }
-        c.disconnect();
-    }
-
-    private List<String> fetchDownloadUrls(String urlStr) throws Exception {
-        HttpURLConnection c = (HttpURLConnection) new URL(urlStr).openConnection();
-        c.setConnectTimeout(20_000);
-        c.setReadTimeout(30_000);
-        c.setRequestMethod("GET");
-        c.setRequestProperty("Accept", "application/json");
-        c.connect();
-
-        int code = c.getResponseCode();
-        if (code / 100 != 2) {
-            String msg = "Downloads HTTP " + code + " "
-                    + c.getResponseMessage();
-            c.disconnect();
-            throw new RuntimeException(msg);
-        }
-
-        StringBuilder sb = new StringBuilder();
-        try (BufferedReader br = new BufferedReader(
-                new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8))) {
-            String line;
-            while ((line = br.readLine()) != null) sb.append(line);
-        } finally {
-            c.disconnect();
-        }
-
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8))) {
+            String line; while ((line = br.readLine()) != null) sb.append(line);
+        } finally { c.disconnect(); }
         List<String> urls = new ArrayList<>();
-        JSONObject obj = new JSONObject(sb.toString());
-        JSONArray items = obj.optJSONArray("items");
-        if (items != null) {
-            for (int i = 0; i < items.length(); i++) {
-                JSONObject it = items.optJSONObject(i);
-                if (it != null) {
-                    String u = it.optString("url", "").trim();
-                    if (!u.isEmpty()) urls.add(u);
-                }
-            }
+        JSONArray items = new JSONObject(sb.toString()).optJSONArray("items");
+        if (items != null) for (int i = 0; i < items.length(); i++) {
+            String u = items.optJSONObject(i).optString("url", "").trim();
+            if (!u.isEmpty()) urls.add(u);
         }
         return urls;
     }
 
-    // ===== Player init =====
+    private int downloadAllWithResume(List<String> urls, File dir) {
+        if (urls == null || urls.isEmpty()) return 0;
+        ui.post(() -> toast("Downloading " + urls.size() + " video(s)…"));
+        int ok = 0;
+        for (String url : urls) {
+            try {
+                File f = bigFileDownloadWithResume(url, dir);
+                if (f != null && f.exists() && f.length() > 0) ok++;
+            } catch (Exception e) { Log.e(TAG, "DL fail: " + e.getMessage()); }
+        }
+        return ok;
+    }
+
+    private File bigFileDownloadWithResume(String urlStr, File dir) throws Exception {
+        String name = filenameFromUrl(urlStr);
+        File part = new File(dir, name + ".part");
+        long have = part.exists() ? part.length() : 0;
+        String finalUrl = resolveRedirects(urlStr);
+
+        for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+            HttpURLConnection c = (HttpURLConnection) new URL(finalUrl).openConnection();
+            c.setConnectTimeout(120_000); c.setReadTimeout(120_000);
+            if (have > 0) c.setRequestProperty("Range", "bytes=" + have + "-");
+            int code = c.getResponseCode();
+            if (code == 200 || code == 206) {
+                String cd = c.getHeaderField("Content-Disposition");
+                String fn = cd != null && cd.contains("filename=") ? cd.substring(cd.indexOf("filename=") + 9).replace("\"", "").trim() : name;
+                File out = new File(dir, fn.isEmpty() ? name : fn);
+                if (code == 200 && have > 0) { part.delete(); have = 0; }
+                try (InputStream in = c.getInputStream(); FileOutputStream fos = new FileOutputStream(part, have > 0)) {
+                    byte[] buf = new byte[131072]; int n;
+                    while ((n = in.read(buf)) != -1) fos.write(buf, 0, n);
+                } finally { c.disconnect(); }
+                if (out.exists()) out.delete();
+                part.renameTo(out);
+                return out;
+            }
+            c.disconnect();
+            Thread.sleep(1500L * (attempt + 1));
+            have = part.exists() ? part.length() : 0;
+        }
+        throw new RuntimeException("Download failed");
+    }
+
+    private String resolveRedirects(String url) throws Exception {
+        for (int i = 0; i < 10; i++) {
+            HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+            c.setInstanceFollowRedirects(false); c.setRequestMethod("HEAD"); c.connect();
+            int code = c.getResponseCode();
+            String loc = c.getHeaderField("Location");
+            c.disconnect();
+            if (code / 100 == 3 && loc != null) { url = loc; continue; }
+            return url;
+        }
+        return url;
+    }
+
+    private String filenameFromUrl(String url) {
+        String p = url.contains("?") ? url.substring(0, url.indexOf('?')) : url;
+        int s = p.lastIndexOf('/');
+        String n = s >= 0 ? p.substring(s + 1) : "video.mp4";
+        return n.isEmpty() ? "video.mp4" : n.replaceAll("[\\\\/:*?\"<>|]", "_");
+    }
+
+    private void playLocalPlaylistOrToast(File dir) {
+        List<File> files = listMp4(dir);
+        if (files.isEmpty()) { ui.post(() -> toast("No videos found")); return; }
+        currentPlaylistFiles = new ArrayList<>(files);
+        lastAppliedRotation = -9999;
+        lastAppliedFitMode = "";
+
+        ui.post(() -> {
+            initPlayer();
+            List<MediaItem> items = new ArrayList<>();
+            for (File f : files) if (f.exists() && f.length() > 0) items.add(MediaItem.fromUri(Uri.fromFile(f)));
+            if (items.isEmpty()) { toast("No playable videos"); return; }
+            player.setMediaItems(items, true);
+            player.setRepeatMode(Player.REPEAT_MODE_ALL);
+            player.addListener(new Player.Listener() {
+                @Override
+                public void onMediaItemTransition(MediaItem m, int r) {
+                    lastAppliedRotation = -9999;
+                    lastAppliedFitMode = "";
+                    applyRotationForCurrentVideo();
+                }
+
+                @Override
+                public void onVideoSizeChanged(VideoSize size) {
+                    videoWidth = size.width;
+                    videoHeight = size.height;
+                    Log.d(TAG, "Video size: " + videoWidth + "x" + videoHeight);
+                    // Re-apply transform with correct video dimensions
+                    applyRotationForCurrentVideo();
+                }
+            });
+            player.prepare();
+            player.play();
+
+            // Apply initial rotation after a delay
+            textureView.postDelayed(() -> applyRotationForCurrentVideo(), 500);
+        });
+    }
+
+    private List<File> listMp4(File dir) {
+        File[] arr = dir.listFiles((d, n) -> n.toLowerCase().endsWith(".mp4"));
+        if (arr == null) return new ArrayList<>();
+        List<File> list = new ArrayList<>();
+        Collections.addAll(list, arr);
+        list.sort(Comparator.comparing(f -> f.getName().toLowerCase()));
+        return list;
+    }
+
+    private boolean readDownloadStatus(String url) throws Exception {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setConnectTimeout(20_000); c.setReadTimeout(30_000); c.connect();
+        if (c.getResponseCode() / 100 != 2) { c.disconnect(); return false; }
+        StringBuilder sb = new StringBuilder();
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8))) {
+            String line; while ((line = br.readLine()) != null) sb.append(line);
+        } finally { c.disconnect(); }
+        JSONObject o = new JSONObject(sb.toString());
+        return o.optBoolean("download_status", false) || o.optBoolean("status", false);
+    }
+
+    private void postUpdateStatusTrue(String url) throws Exception {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setRequestMethod("POST"); c.setDoOutput(true);
+        c.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+        try (DataOutputStream out = new DataOutputStream(c.getOutputStream())) {
+            out.write("{\"status\": true}".getBytes(StandardCharsets.UTF_8));
+        }
+        c.getResponseCode(); c.disconnect();
+    }
 
     private void initPlayer() {
         if (player != null) return;
         player = new ExoPlayer.Builder(this).build();
-        playerView.setPlayer(player);
-        player.setRepeatMode(Player.REPEAT_MODE_ALL);
 
+        // Connect player to TextureView surface
+        if (surface != null) {
+            player.setVideoSurface(surface);
+        }
+
+        player.setRepeatMode(Player.REPEAT_MODE_ALL);
         player.addListener(new Player.Listener() {
             @Override
-            public void onPlayerError(PlaybackException error) {
+            public void onPlayerError(PlaybackException e) {
+                Log.e(TAG, "Player error: " + e.getMessage());
                 int idx = player.getCurrentMediaItemIndex();
                 if (player.getMediaItemCount() > 0) {
-                    try {
-                        player.removeMediaItem(idx);
-                        if (player.getMediaItemCount() > 0) {
-                            player.seekTo(
-                                    Math.min(idx, player.getMediaItemCount() - 1),
-                                    0
-                            );
-                            player.play();
-                            return;
-                        }
-                    } catch (Exception ignored) {
+                    player.removeMediaItem(idx);
+                    if (player.getMediaItemCount() > 0) {
+                        player.seekTo(Math.min(idx, player.getMediaItemCount()-1), 0);
+                        player.play();
                     }
                 }
-                toast("Play error: " + error.getMessage());
             }
         });
     }
 
-    // ===== Fullscreen UI helpers =====
-
     private void applyImmersive() {
-        View decor = getWindow().getDecorView();
+        View d = getWindow().getDecorView();
         if (Build.VERSION.SDK_INT >= 30) {
-            WindowInsetsController c = decor.getWindowInsetsController();
+            WindowInsetsController c = d.getWindowInsetsController();
             if (c != null) {
-                c.hide(WindowInsets.Type.statusBars()
-                        | WindowInsets.Type.navigationBars());
-                c.setSystemBarsBehavior(
-                        WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-                );
+                c.hide(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
+                c.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
             }
         } else {
-            decor.setSystemUiVisibility(
-                    View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-                            | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-                            | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                            | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                            | View.SYSTEM_UI_FLAG_FULLSCREEN
-                            | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-            );
+            d.setSystemUiVisibility(View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
         }
     }
 
     @SuppressLint("HardwareIds")
-    private String getAndroidId() {
-        return Settings.Secure.getString(
-                getContentResolver(),
-                Settings.Secure.ANDROID_ID
-        );
-    }
+    private String getAndroidId() { return Settings.Secure.getString(getContentResolver(), Settings.Secure.ANDROID_ID); }
 
-    private File ensureMainDir() {
-        File d = new File(Environment.getExternalStorageDirectory(), ROOT_DIR);
-        if (!d.exists() && !d.mkdirs()) {
-            throw new RuntimeException("Failed to create " + d.getAbsolutePath());
-        }
-        return d;
-    }
+    private File ensureMainDir() { File d = new File(Environment.getExternalStorageDirectory(), ROOT_DIR); if (!d.exists()) d.mkdirs(); return d; }
+    private File ensureTempDir() { File d = new File(Environment.getExternalStorageDirectory(), TEMP_DIR); if (!d.exists()) d.mkdirs(); return d; }
+    private void toast(String s) { Toast.makeText(this, s, Toast.LENGTH_LONG).show(); }
 
-    private File ensureTempDir() {
-        File d = new File(Environment.getExternalStorageDirectory(), TEMP_DIR);
-        if (!d.exists() && !d.mkdirs()) {
-            throw new RuntimeException("Failed to create " + d.getAbsolutePath());
-        }
-        return d;
-    }
-
-    private void toast(String s) {
-        Toast.makeText(this, s, Toast.LENGTH_LONG).show();
-    }
-
-    // ================= BLUETOOTH (BLE) SECTION =================
-
+    // ===== BLE =====
     private void ensureBluetoothPermissionAndConnect() {
-        if (btAdapter == null) return;
-
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            boolean hasConnect = ContextCompat.checkSelfPermission(
-                    this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED;
-            boolean hasScan = ContextCompat.checkSelfPermission(
-                    this, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED;
-
-            if (!hasConnect || !hasScan) {
-                ActivityCompat.requestPermissions(
-                        this,
-                        new String[]{
-                                Manifest.permission.BLUETOOTH_CONNECT,
-                                Manifest.permission.BLUETOOTH_SCAN
-                        },
-                        REQ_BT_PERMS
-                );
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED ||
+                    ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN}, REQ_BT_PERMS);
                 return;
             }
         }
@@ -1039,480 +807,125 @@ public class FullScreenPlayerActivity extends AppCompatActivity {
     }
 
     @Override
-    public void onRequestPermissionsResult(int requestCode,
-                                           String[] permissions,
-                                           int[] grantResults) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        if (requestCode == REQ_BT_PERMS) {
-            boolean granted = true;
-            if (grantResults.length == 0) {
-                granted = false;
-            } else {
-                for (int r : grantResults) {
-                    if (r != PackageManager.PERMISSION_GRANTED) {
-                        granted = false;
-                        break;
-                    }
-                }
-            }
-            if (granted) {
-                autoConnectToEsp32();
-            } else {
-                toast("Bluetooth permissions denied (Nearby devices).");
-            }
+    public void onRequestPermissionsResult(int req, String[] perms, int[] res) {
+        super.onRequestPermissionsResult(req, perms, res);
+        if (req == REQ_BT_PERMS) {
+            boolean ok = res.length > 0;
+            for (int r : res) if (r != PackageManager.PERMISSION_GRANTED) ok = false;
+            if (ok) autoConnectToEsp32();
         }
     }
 
     private void autoConnectToEsp32() {
-        if (btAdapter == null) return;
-
-        if (!btAdapter.isEnabled()) {
-            toast("Please enable Bluetooth");
-            return;
-        }
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            boolean hasConnect = ContextCompat.checkSelfPermission(
-                    this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED;
-            boolean hasScan = ContextCompat.checkSelfPermission(
-                    this, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED;
-            if (!hasConnect || !hasScan) {
-                ensureBluetoothPermissionAndConnect();
-                return;
-            }
-        }
-
+        if (btAdapter == null || !btAdapter.isEnabled()) return;
         BluetoothManager bm = (BluetoothManager) getSystemService(BLUETOOTH_SERVICE);
-        if (bm != null) {
-            btAdapter = bm.getAdapter();
-        }
-
-        if (btAdapter == null) {
-            toast("Bluetooth adapter not available");
-            return;
-        }
-
+        if (bm != null) btAdapter = bm.getAdapter();
         bleScanner = btAdapter.getBluetoothLeScanner();
-        if (bleScanner == null) {
-            toast("BLE scanner not available");
-            return;
-        }
-
-        startBleScan();
+        if (bleScanner != null) startBleScan();
     }
 
     private void startBleScan() {
         if (bleScanner == null || bleScanning) return;
         bleScanning = true;
-
-        List<ScanFilter> filters = new ArrayList<>();
-        filters.add(new ScanFilter.Builder()
-                .setDeviceName(ESP32_DEVICE_NAME)
-                .build());
-
-        ScanSettings settings = new ScanSettings.Builder()
-                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-                .build();
-
-        bleScanner.startScan(filters, settings, scanCallback);
-        ui.post(() -> toast("Scanning for " + ESP32_DEVICE_NAME + "…"));
-
-        bleHandler.postDelayed(() -> {
-            if (bleScanning) {
-                stopBleScan();
-                ui.post(() -> toast("ESP32 BLE device not found"));
-                // 🔁 schedule reconnect after scan timeout
-                scheduleBleReconnect();
-            }
-        }, 15_000L);
+        List<ScanFilter> f = new ArrayList<>(); f.add(new ScanFilter.Builder().setDeviceName(ESP32_DEVICE_NAME).build());
+        bleScanner.startScan(f, new ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build(), scanCallback);
+        bleHandler.postDelayed(() -> { if (bleScanning) { stopBleScan(); scheduleBleReconnect(); } }, 15_000L);
     }
 
-    private void stopBleScan() {
-        if (!bleScanning || bleScanner == null) return;
-        try {
-            bleScanner.stopScan(scanCallback);
-        } catch (Exception ignored) {
-        }
-        bleScanning = false;
-    }
-
-    // 🔁 Central helper: keep trying to reconnect as long as btShouldReconnect is true
-    private void scheduleBleReconnect() {
-        if (!btShouldReconnect) return;
-        bleHandler.postDelayed(() -> {
-            if (!btShouldReconnect) return;
-            Log.d("BLE_DEBUG", "Reconnecting to ESP32…");
-            autoConnectToEsp32();
-        }, 5_000L);  // retry after 5 seconds
-    }
+    private void stopBleScan() { if (bleScanning && bleScanner != null) { try { bleScanner.stopScan(scanCallback); } catch (Exception ignored) {} bleScanning = false; } }
+    private void scheduleBleReconnect() { if (btShouldReconnect) bleHandler.postDelayed(this::autoConnectToEsp32, 5_000L); }
 
     private final ScanCallback scanCallback = new ScanCallback() {
-        @Override
-        public void onScanResult(int callbackType, ScanResult result) {
-            BluetoothDevice device = result.getDevice();
-            if (device == null) return;
-
-            String name = device.getName();
-            if (name == null) return;
-
-            if (ESP32_DEVICE_NAME.equals(name)) {
+        @Override public void onScanResult(int t, ScanResult r) {
+            BluetoothDevice dev = r.getDevice();
+            if (dev != null && ESP32_DEVICE_NAME.equals(dev.getName())) {
                 stopBleScan();
-                ui.post(() -> toast("Found " + ESP32_DEVICE_NAME + ", connecting…"));
-
-                try {
-                    btGatt = device.connectGatt(
-                            FullScreenPlayerActivity.this,
-                            false,
-                            gattCallback
-                    );
-                } catch (SecurityException e) {
-                    ui.post(() -> toast("BLE connect permission error: " + e.getMessage()));
-                    scheduleBleReconnect();
-                }
+                try { btGatt = dev.connectGatt(FullScreenPlayerActivity.this, false, gattCallback); } catch (Exception e) { scheduleBleReconnect(); }
             }
         }
-
-        @Override
-        public void onScanFailed(int errorCode) {
-            ui.post(() -> toast("BLE scan failed: " + errorCode));
-            // 🔁 retry scanning after delay
-            scheduleBleReconnect();
-        }
+        @Override public void onScanFailed(int e) { scheduleBleReconnect(); }
     };
 
     private final BluetoothGattCallback gattCallback = new BluetoothGattCallback() {
-
-        @Override
-        public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
-            super.onConnectionStateChange(gatt, status, newState);
-
-            if (newState == BluetoothGatt.STATE_CONNECTED) {
-                ui.post(() -> toast("Connected to ESP32 (BLE)"));
-                try {
-                    gatt.discoverServices();
-                } catch (SecurityException e) {
-                    ui.post(() -> toast("discoverServices permission error: " + e.getMessage()));
-                }
-            } else if (newState == BluetoothGatt.STATE_DISCONNECTED) {
-                ui.post(() -> toast("ESP32 BLE disconnected"));
-                try {
-                    gatt.close();
-                } catch (Exception ignored) {
-                }
-
-                // 🔁 Keep trying while btShouldReconnect is true
-                scheduleBleReconnect();
-            }
+        @Override public void onConnectionStateChange(BluetoothGatt g, int s, int n) {
+            if (n == BluetoothGatt.STATE_CONNECTED) { try { g.discoverServices(); } catch (Exception ignored) {} }
+            else if (n == BluetoothGatt.STATE_DISCONNECTED) { try { g.close(); } catch (Exception ignored) {} scheduleBleReconnect(); }
         }
-
-        @Override
-        public void onServicesDiscovered(BluetoothGatt gatt, int status) {
-            super.onServicesDiscovered(gatt, status);
-
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                ui.post(() -> toast("Service discovery failed: " + status));
-                // try again later
-                scheduleBleReconnect();
-                return;
-            }
-
-            BluetoothGattService service = gatt.getService(NUS_SERVICE_UUID);
-            if (service == null) {
-                ui.post(() -> toast("NUS service not found on ESP32"));
-                scheduleBleReconnect();
-                return;
-            }
-
-            nusTxChar = service.getCharacteristic(NUS_CHAR_TX_UUID);
-            nusRxChar = service.getCharacteristic(NUS_CHAR_RX_UUID);
-
-            if (nusTxChar == null || nusRxChar == null) {
-                ui.post(() -> toast("NUS characteristics missing"));
-                scheduleBleReconnect();
-                return;
-            }
-
+        @Override public void onServicesDiscovered(BluetoothGatt g, int s) {
+            if (s != BluetoothGatt.GATT_SUCCESS) { scheduleBleReconnect(); return; }
+            BluetoothGattService svc = g.getService(NUS_SERVICE_UUID);
+            if (svc == null) { scheduleBleReconnect(); return; }
+            nusTxChar = svc.getCharacteristic(NUS_CHAR_TX_UUID);
+            nusRxChar = svc.getCharacteristic(NUS_CHAR_RX_UUID);
+            if (nusTxChar == null || nusRxChar == null) { scheduleBleReconnect(); return; }
             try {
-                gatt.setCharacteristicNotification(nusTxChar, true);
-                BluetoothGattDescriptor cccd = nusTxChar.getDescriptor(CCCD_UUID);
-                if (cccd != null) {
-                    cccd.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
-                    gatt.writeDescriptor(cccd);
-                }
-            } catch (SecurityException e) {
-                ui.post(() -> toast("Enable notifications error: " + e.getMessage()));
-                scheduleBleReconnect();
-            }
+                g.setCharacteristicNotification(nusTxChar, true);
+                BluetoothGattDescriptor d = nusTxChar.getDescriptor(CCCD_UUID);
+                if (d != null) { d.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE); g.writeDescriptor(d); }
+            } catch (Exception e) { scheduleBleReconnect(); }
         }
-
-        @Override
-        public void onCharacteristicChanged(BluetoothGatt gatt,
-                                            BluetoothGattCharacteristic characteristic) {
-            super.onCharacteristicChanged(gatt, characteristic);
-
-            if (!NUS_CHAR_TX_UUID.equals(characteristic.getUuid())) return;
-
-            byte[] value = characteristic.getValue();
-            if (value == null || value.length == 0) return;
-
-            // Convert full notification to a string
-            String msg = new String(value, StandardCharsets.UTF_8).trim();
-
-            Log.d("BLE_DEBUG_RAW", "RX: [" + msg + "]");
-
-            // Treat every notify as one line
-            if (!msg.isEmpty()) {
-                handleBtCommand(msg);
-            }
+        @Override public void onCharacteristicChanged(BluetoothGatt g, BluetoothGattCharacteristic c) {
+            if (!NUS_CHAR_TX_UUID.equals(c.getUuid())) return;
+            byte[] v = c.getValue(); if (v == null) return;
+            String msg = new String(v, StandardCharsets.UTF_8).trim();
+            if (!msg.isEmpty()) handleBtCommand(msg);
         }
-
     };
 
-    /**
-     * Called for every line received from ESP32 over BLE.
-     * We:
-     *  - handle PLAY / PAUSE / NEXT,
-     *  - if it contains "Temperature", parse the value and store in lastTemperatureValue,
-     *  - if it is "REED" + "OPEN", increment daily & monthly counts.
-     *  - actual temperature POST is done by the 5s timer (tempPostRunnable)
-     */
-    private void handleBtCommand(String cmdRaw) {
-        final String cmd = cmdRaw.trim();
-        final String lower = cmd.toLowerCase(Locale.US);
-
-        Log.d("BLE_DEBUG", "From ESP32: [" + cmd + "]");
-
-        // ------------ 1) TEMPERATURE ------------
-        boolean hasTemp = lower.contains("temperature");
-        if (hasTemp) {
-            // Very simple parse: find the first number
+    private void handleBtCommand(String cmd) {
+        String lower = cmd.toLowerCase(Locale.US);
+        if (lower.contains("temperature")) {
             Matcher m = TEMP_PATTERN.matcher(cmd);
-            if (m.find()) {
-                try {
-                    float tempC = Float.parseFloat(m.group(1));
-                    lastTemperatureValue = tempC;
-
-                    Log.d("BLE_DEBUG", "Updated last temperature from ESP32: " + tempC);
-
-                } catch (NumberFormatException e) {
-                    Log.e("BLE_DEBUG", "Temp parse error: " + e.getMessage());
-                }
-            } else {
-                Log.w("BLE_DEBUG", "No number found in temp line: " + cmd);
-            }
+            if (m.find()) try { lastTemperatureValue = Float.parseFloat(m.group(1)); } catch (Exception ignored) {}
         }
-
-        // ------------ 2) REED OPEN ------------
-        boolean hasReedOpen = lower.contains("reed") && lower.contains("open");
-        if (hasReedOpen) {
-            Log.d("BLE_DEBUG", "REED OPEN → increment counts");
-            incrementDailyAndMonthly();
-        }
-
-        final boolean isTempLine = hasTemp;
-        final boolean isReedLine = lower.contains("reed");
-
-        // ------------ 3) Player commands & other toasts ------------
+        if (lower.contains("reed") && lower.contains("open")) incrementCounts();
         ui.post(() -> {
-            // Don’t spam toast for REED and temp
-            if (!isTempLine && !isReedLine) {
-                toast("From ESP32: " + cmd);
-            }
-
-            String upper = cmd.toUpperCase(Locale.US);
-            switch (upper) {
-                case "PLAY":
-                    if (player != null) player.play();
-                    break;
-                case "PAUSE":
-                    if (player != null) player.pause();
-                    break;
-                case "NEXT":
-                    if (player != null && player.getMediaItemCount() > 0) {
-                        int next = (player.getCurrentMediaItemIndex() + 1)
-                                % player.getMediaItemCount();
-                        player.seekTo(next, 0);
-                        player.play();
-                    }
-                    break;
-                default:
-                    break;
+            switch (cmd.toUpperCase(Locale.US)) {
+                case "PLAY": if (player != null) player.play(); break;
+                case "PAUSE": if (player != null) player.pause(); break;
+                case "NEXT": if (player != null && player.getMediaItemCount() > 0) { player.seekTo((player.getCurrentMediaItemIndex()+1) % player.getMediaItemCount(), 0); player.play(); } break;
             }
         });
     }
 
-    /**
-     * Sends the temperature value to:
-     *   POST /device/{android_id}/temperature_update
-     *   { "temperature": <value> }
-     */
-    private void sendTemperatureToServer(float tempC) {
-        final String androidId = getAndroidId();
-        final String url = updateTemperatureUrl(androidId);
-
+    private void sendTemperatureToServer(float t) {
         new Thread(() -> {
             try {
-                postTemperature(url, tempC);
-            } catch (Exception e) {
-                ui.post(() ->
-                        toast("Failed to send temperature: " + e.getMessage()));
-            }
-        }).start();
-    }
-
-    private void postTemperature(String urlStr, float tempC) throws Exception {
-        HttpURLConnection c = (HttpURLConnection) new URL(urlStr).openConnection();
-        c.setConnectTimeout(20_000);
-        c.setReadTimeout(30_000);
-        c.setRequestMethod("POST");
-        c.setDoOutput(true);
-        c.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
-        c.setRequestProperty("Accept", "application/json");
-
-        String payload = String.format(Locale.US, "{\"temperature\": %.2f}", tempC);
-
-        try (DataOutputStream out = new DataOutputStream(c.getOutputStream())) {
-            out.write(payload.getBytes(StandardCharsets.UTF_8));
-            out.flush();
-        }
-
-        int code = c.getResponseCode();
-        if (code / 100 != 2) {
-            String msg = "Temp update HTTP " + code + " " + c.getResponseMessage();
-            c.disconnect();
-            throw new RuntimeException(msg);
-        }
-        c.disconnect();
-    }
-
-    // ===== daily + monthly increment logic =====
-
-    private void incrementDailyAndMonthly() {
-        new Thread(() -> {
-            try {
-                String androidId = getAndroidId();
-
-                DeviceCounts counts = fetchDeviceCounts(countsUrl(androidId));
-                int newDaily = counts.daily + 1;
-                int newMonthly = counts.monthly + 1;
-
-                postDailyCount(dailyUpdateUrl(androidId), newDaily);
-                postMonthlyCount(monthlyUpdateUrl(androidId), newMonthly);
-
-            } catch (Exception e) {
-                ui.post(() -> toast("Failed to update counts: " + e.getMessage()));
-            }
-        }).start();
-    }
-
-    private DeviceCounts fetchDeviceCounts(String urlStr) throws Exception {
-        HttpURLConnection c = (HttpURLConnection) new URL(urlStr).openConnection();
-        c.setConnectTimeout(20_000);
-        c.setReadTimeout(30_000);
-        c.setRequestMethod("GET");
-        c.setRequestProperty("Accept", "application/json");
-        c.connect();
-
-        int code = c.getResponseCode();
-        if (code / 100 != 2) {
-            String msg = "Counts HTTP " + code + " " + c.getResponseMessage();
-            c.disconnect();
-            throw new RuntimeException(msg);
-        }
-
-        StringBuilder sb = new StringBuilder();
-        try (BufferedReader br = new BufferedReader(
-                new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8))) {
-            String line;
-            while ((line = br.readLine()) != null) sb.append(line);
-        } finally {
-            c.disconnect();
-        }
-
-        JSONObject obj = new JSONObject(sb.toString());
-        DeviceCounts dc = new DeviceCounts();
-        dc.daily = obj.optInt("daily_count", 0);
-        dc.monthly = obj.optInt("monthly_count", 0);
-        return dc;
-    }
-
-    private void postDailyCount(String urlStr, int value) throws Exception {
-        HttpURLConnection c = (HttpURLConnection) new URL(urlStr).openConnection();
-        c.setConnectTimeout(20_000);
-        c.setReadTimeout(30_000);
-        c.setRequestMethod("POST");
-        c.setDoOutput(true);
-        c.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
-        c.setRequestProperty("Accept", "application/json");
-
-        String payload = "{\"daily_count\": " + value + "}";
-
-        try (DataOutputStream out = new DataOutputStream(c.getOutputStream())) {
-            out.write(payload.getBytes(StandardCharsets.UTF_8));
-            out.flush();
-        }
-
-        int code = c.getResponseCode();
-        if (code / 100 != 2) {
-            String msg = "Daily update HTTP " + code + " " + c.getResponseMessage();
-            c.disconnect();
-            throw new RuntimeException(msg);
-        }
-        c.disconnect();
-    }
-
-    private void postMonthlyCount(String urlStr, int value) throws Exception {
-        HttpURLConnection c = (HttpURLConnection) new URL(urlStr).openConnection();
-        c.setConnectTimeout(20_000);
-        c.setReadTimeout(30_000);
-        c.setRequestMethod("POST");
-        c.setDoOutput(true);
-        c.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
-        c.setRequestProperty("Accept", "application/json");
-
-        String payload = "{\"monthly_count\": " + value + "}";
-
-        try (DataOutputStream out = new DataOutputStream(c.getOutputStream())) {
-            out.write(payload.getBytes(StandardCharsets.UTF_8));
-            out.flush();
-        }
-
-        int code = c.getResponseCode();
-        if (code / 100 != 2) {
-            String msg = "Monthly update HTTP " + code + " " + c.getResponseMessage();
-            c.disconnect();
-            throw new RuntimeException(msg);
-        }
-        c.disconnect();
-    }
-
-    // Write text to ESP32 via BLE (NUS RX characteristic)
-    private void sendToEsp32(String text) {
-        final BluetoothGatt gattLocal = btGatt;
-        final BluetoothGattCharacteristic rxLocal = nusRxChar;
-
-        if (gattLocal == null || rxLocal == null) {
-            return;
-        }
-
-        new Thread(() -> {
-            try {
-                String msg = text + "\n";
-                rxLocal.setValue(msg.getBytes(StandardCharsets.UTF_8));
-                rxLocal.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
-
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    gattLocal.writeCharacteristic(
-                            rxLocal,
-                            rxLocal.getValue(),
-                            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-                    );
-                } else {
-                    gattLocal.writeCharacteristic(rxLocal);
+                HttpURLConnection c = (HttpURLConnection) new URL(updateTemperatureUrl(getAndroidId())).openConnection();
+                c.setRequestMethod("POST"); c.setDoOutput(true);
+                c.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+                try (DataOutputStream out = new DataOutputStream(c.getOutputStream())) {
+                    out.write(String.format(Locale.US, "{\"temperature\": %.2f}", t).getBytes(StandardCharsets.UTF_8));
                 }
-            } catch (SecurityException ignored) {
-                // Missing BLUETOOTH_CONNECT permission, ignore for now
-            }
+                c.getResponseCode(); c.disconnect();
+            } catch (Exception ignored) {}
         }).start();
+    }
+
+    private void incrementCounts() {
+        new Thread(() -> {
+            try {
+                String id = getAndroidId();
+                HttpURLConnection c = (HttpURLConnection) new URL(countsUrl(id)).openConnection();
+                c.connect();
+                StringBuilder sb = new StringBuilder();
+                try (BufferedReader br = new BufferedReader(new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8))) {
+                    String line; while ((line = br.readLine()) != null) sb.append(line);
+                } finally { c.disconnect(); }
+                JSONObject o = new JSONObject(sb.toString());
+                postCount(dailyUpdateUrl(id), "daily_count", o.optInt("daily_count", 0) + 1);
+                postCount(monthlyUpdateUrl(id), "monthly_count", o.optInt("monthly_count", 0) + 1);
+            } catch (Exception ignored) {}
+        }).start();
+    }
+
+    private void postCount(String url, String key, int val) throws Exception {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setRequestMethod("POST"); c.setDoOutput(true);
+        c.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+        try (DataOutputStream out = new DataOutputStream(c.getOutputStream())) {
+            out.write(("{\"" + key + "\": " + val + "}").getBytes(StandardCharsets.UTF_8));
+        }
+        c.getResponseCode(); c.disconnect();
     }
 }
