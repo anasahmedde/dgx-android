@@ -802,8 +802,17 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
         if (files.isEmpty()) { ui.post(() -> toast("No videos found")); return; }
         currentPlaylistFiles = new ArrayList<>(files);
         
-        // Pre-apply rotation for first video BEFORE resetting
-        VideoMetadata firstVm = getMetadataForFile(files.get(0));
+        // Pre-load ALL video metadata into a map for instant access
+        final Map<String, VideoMetadata> metadataCache = new HashMap<>();
+        for (File f : files) {
+            VideoMetadata vm = getMetadataForFile(f);
+            if (vm != null) {
+                metadataCache.put(f.getName().toLowerCase(), vm);
+            }
+        }
+        
+        // Get first video's rotation
+        VideoMetadata firstVm = metadataCache.get(files.get(0).getName().toLowerCase());
         int firstRotation = firstVm != null ? firstVm.rotation : 0;
         String firstFitMode = firstVm != null ? firstVm.fitMode : "cover";
         lastAppliedRotation = firstRotation;
@@ -815,7 +824,7 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             for (File f : files) if (f.exists() && f.length() > 0) items.add(MediaItem.fromUri(Uri.fromFile(f)));
             if (items.isEmpty()) { toast("No playable videos"); return; }
             
-            // Apply transform BEFORE starting playback to prevent glitch
+            // Apply transform BEFORE starting playback
             applyTextureViewTransform(firstRotation, firstFitMode);
             
             player.setMediaItems(items, true);
@@ -823,19 +832,35 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
             player.addListener(new Player.Listener() {
                 @Override
                 public void onMediaItemTransition(MediaItem m, int r) {
-                    // Get next video's rotation BEFORE resetting
                     int nextIdx = player.getCurrentMediaItemIndex();
                     if (nextIdx >= 0 && nextIdx < currentPlaylistFiles.size()) {
                         File nextFile = currentPlaylistFiles.get(nextIdx);
-                        VideoMetadata nextVm = getMetadataForFile(nextFile);
+                        VideoMetadata nextVm = metadataCache.get(nextFile.getName().toLowerCase());
                         int nextRotation = nextVm != null ? nextVm.rotation : 0;
                         String nextFitMode = nextVm != null ? nextVm.fitMode : "cover";
                         
-                        // Apply immediately if different
-                        if (nextRotation != lastAppliedRotation || !nextFitMode.equals(lastAppliedFitMode)) {
-                            lastAppliedRotation = nextRotation;
-                            lastAppliedFitMode = nextFitMode;
-                            applyTextureViewTransform(nextRotation, nextFitMode);
+                        // IMMEDIATELY apply rotation (no delay) - video is already faded out
+                        applyTextureViewTransform(nextRotation, nextFitMode);
+                        lastAppliedRotation = nextRotation;
+                        lastAppliedFitMode = nextFitMode;
+                        
+                        // Fade in after rotation is applied
+                        if (textureView != null && textureView.getAlpha() < 1f) {
+                            textureView.animate().alpha(1f).setDuration(200).start();
+                        }
+                    }
+                }
+
+                @Override
+                public void onPlaybackStateChanged(int state) {
+                    // When video is about to end, fade out BEFORE transition
+                    if (state == Player.STATE_ENDED || 
+                        (player != null && player.getCurrentPosition() > 0 && 
+                         player.getDuration() > 0 && 
+                         player.getDuration() - player.getCurrentPosition() < 300)) {
+                        // About to transition - fade out now
+                        if (textureView != null && currentPlaylistFiles.size() > 1) {
+                            textureView.animate().alpha(0f).setDuration(150).start();
                         }
                     }
                 }
@@ -845,13 +870,82 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
                     videoWidth = size.width;
                     videoHeight = size.height;
                     Log.d(TAG, "Video size: " + videoWidth + "x" + videoHeight);
-                    // Re-apply transform with correct video dimensions
+                    // Re-apply current rotation (not default!)
                     applyTextureViewTransform(lastAppliedRotation, lastAppliedFitMode);
                 }
             });
+            
+            // Start a handler to check for upcoming transitions and pre-fade
+            startTransitionWatcher();
+            
             player.prepare();
             player.play();
         });
+    }
+
+    // Watch for upcoming video transitions and fade out before they happen
+    private void startTransitionWatcher() {
+        final Handler transitionHandler = new Handler(Looper.getMainLooper());
+        final Runnable transitionChecker = new Runnable() {
+            @Override
+            public void run() {
+                if (player == null || currentPlaylistFiles == null || currentPlaylistFiles.size() <= 1) {
+                    return;
+                }
+                
+                long position = player.getCurrentPosition();
+                long duration = player.getDuration();
+                
+                // If we're within 250ms of the end, start fading out
+                if (duration > 0 && position > 0 && (duration - position) < 250 && (duration - position) > 50) {
+                    if (textureView != null && textureView.getAlpha() > 0.5f) {
+                        // Pre-apply the NEXT video's rotation while fading out
+                        int currentIdx = player.getCurrentMediaItemIndex();
+                        int nextIdx = (currentIdx + 1) % currentPlaylistFiles.size();
+                        File nextFile = currentPlaylistFiles.get(nextIdx);
+                        VideoMetadata nextVm = getMetadataForFile(nextFile);
+                        int nextRotation = nextVm != null ? nextVm.rotation : 0;
+                        String nextFitMode = nextVm != null ? nextVm.fitMode : "cover";
+                        
+                        // Fade out and pre-apply rotation
+                        textureView.animate()
+                            .alpha(0f)
+                            .setDuration(200)
+                            .withEndAction(() -> {
+                                applyTextureViewTransform(nextRotation, nextFitMode);
+                                lastAppliedRotation = nextRotation;
+                                lastAppliedFitMode = nextFitMode;
+                            })
+                            .start();
+                    }
+                }
+                
+                // Keep checking while playing
+                if (player != null && player.isPlaying()) {
+                    transitionHandler.postDelayed(this, 50);
+                }
+            }
+        };
+        
+        // Start checking after playback begins
+        transitionHandler.postDelayed(transitionChecker, 500);
+    }
+
+    // Smooth fade transition when changing rotation (kept for manual triggers)
+    private void fadeOutApplyRotationFadeIn(int rotation, String fitMode) {
+        if (textureView == null) return;
+        
+        textureView.animate()
+            .alpha(0f)
+            .setDuration(150)
+            .withEndAction(() -> {
+                applyTextureViewTransform(rotation, fitMode);
+                textureView.animate()
+                    .alpha(1f)
+                    .setDuration(150)
+                    .start();
+            })
+            .start();
     }
 
     private List<File> listMp4(File dir) {
