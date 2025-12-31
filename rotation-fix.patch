@@ -1,0 +1,279 @@
+diff --git a/.idea/.name b/.idea/.name
+new file mode 100644
+index 0000000..b5bb975
+--- /dev/null
++++ b/.idea/.name
+@@ -0,0 +1 @@
++videoplayer
+\ No newline at end of file
+diff --git a/app/src/main/java/com/example/videoplayer/FullScreenPlayerActivity.java b/app/src/main/java/com/example/videoplayer/FullScreenPlayerActivity.java
+index b97102b..6dbfc91 100644
+--- a/app/src/main/java/com/example/videoplayer/FullScreenPlayerActivity.java
++++ b/app/src/main/java/com/example/videoplayer/FullScreenPlayerActivity.java
+@@ -8,7 +8,9 @@ import java.util.Collections;
+ import java.util.Comparator;
+ import java.util.List;
+ import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.Map;
++import java.util.Set;
+ import java.net.HttpURLConnection;
+ import java.net.URL;
+ import java.io.BufferedReader;
+@@ -496,46 +498,139 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
+                 String id = getAndroidId();
+                 try { postOnlineTrue(updateOnlineUrl(id)); } catch (Exception ignored) {}
+ 
+-                if (!isOnline()) { ui.post(() -> toast("Offline")); playLocalPlaylistOrToast(mainDir); return; }
++                if (!isOnline()) { 
++                    ui.post(() -> toast("Offline - playing local videos")); 
++                    playLocalPlaylistOrToast(mainDir); 
++                    return; 
++                }
+ 
+                 if (!readDownloadStatus(readStatusUrl(id))) {
+                     downloadInProgress = true;
+                     try {
+-                        deleteAllInDirectory(tmpDir);
+-                        List<String> urls = fetchDownloadUrls(listDownloadsUrl(id));
+-                        if (downloadAllWithResume(urls, tmpDir) == urls.size() && !urls.isEmpty()) {
+-                            stopPlaybackForRefresh();
+-                            atomicSwapIntoMain(mainDir, tmpDir);
+-                            postUpdateStatusTrue(updateStatusUrl(id));
+-                        }
++                        // SMART SYNC: Only download new, delete unassigned
++                        smartSyncVideos(mainDir, id);
++                        postUpdateStatusTrue(updateStatusUrl(id));
+                     } finally { downloadInProgress = false; }
+                 }
+                 playLocalPlaylistOrToast(mainDir);
+                 pollRotationMetadata();
+-            } catch (Exception e) { ui.post(() -> toast("Error: " + e.getMessage())); }
++            } catch (Exception e) { 
++                ui.post(() -> toast("Error: " + e.getMessage())); 
++                // On error, try to play local videos anyway
++                try {
++                    File mainDir = ensureMainDir();
++                    playLocalPlaylistOrToast(mainDir);
++                } catch (Exception ignored) {}
++            }
+             finally { isWorking = false; }
+         }).start();
+     }
+ 
++    // Smart sync: only download new videos, delete unassigned ones
++    private void smartSyncVideos(File mainDir, String deviceId) throws Exception {
++        String url = listDownloadsUrl(deviceId);
++        
++        // Get expected filenames from server
++        List<String> expectedFilenames = fetchExpectedFilenames(url);
++        List<String> downloadUrls = fetchDownloadUrls(url);
++        
++        if (expectedFilenames.isEmpty() && downloadUrls.isEmpty()) {
++            Log.d(TAG, "No videos assigned to this device");
++            return;
++        }
++        
++        // Get current local files
++        File[] localFiles = mainDir.listFiles((d, n) -> n.toLowerCase().endsWith(".mp4"));
++        Set<String> localFilenames = new HashSet<>();
++        if (localFiles != null) {
++            for (File f : localFiles) {
++                localFilenames.add(f.getName().toLowerCase());
++            }
++        }
++        
++        // Determine which files to download (new ones)
++        List<String> urlsToDownload = new ArrayList<>();
++        Set<String> expectedSet = new HashSet<>();
++        for (int i = 0; i < downloadUrls.size(); i++) {
++            String urlStr = downloadUrls.get(i);
++            String filename = i < expectedFilenames.size() ? expectedFilenames.get(i) : filenameFromUrl(urlStr);
++            expectedSet.add(filename.toLowerCase());
++            
++            if (!localFilenames.contains(filename.toLowerCase())) {
++                urlsToDownload.add(urlStr);
++                Log.d(TAG, "Will download new video: " + filename);
++            } else {
++                Log.d(TAG, "Video already exists locally: " + filename);
++            }
++        }
++        
++        // Determine which local files to delete (unassigned)
++        List<File> filesToDelete = new ArrayList<>();
++        if (localFiles != null) {
++            for (File f : localFiles) {
++                if (!expectedSet.contains(f.getName().toLowerCase())) {
++                    filesToDelete.add(f);
++                    Log.d(TAG, "Will delete unassigned video: " + f.getName());
++                }
++            }
++        }
++        
++        // Delete unassigned videos
++        for (File f : filesToDelete) {
++            if (f.delete()) {
++                Log.d(TAG, "Deleted: " + f.getName());
++            }
++        }
++        
++        // Download new videos directly to main directory
++        if (!urlsToDownload.isEmpty()) {
++            ui.post(() -> toast("Downloading " + urlsToDownload.size() + " new video(s)…"));
++            int downloaded = 0;
++            for (String urlStr : urlsToDownload) {
++                try {
++                    File f = bigFileDownloadWithResume(urlStr, mainDir);
++                    if (f != null && f.exists() && f.length() > 0) {
++                        downloaded++;
++                        Log.d(TAG, "Downloaded: " + f.getName());
++                    }
++                } catch (Exception e) {
++                    Log.e(TAG, "Download failed: " + e.getMessage());
++                }
++            }
++            final int finalDownloaded = downloaded;
++            ui.post(() -> toast("Downloaded " + finalDownloaded + " video(s)"));
++            
++            // Refresh playlist if we downloaded something or deleted something
++            if (downloaded > 0 || !filesToDelete.isEmpty()) {
++                stopPlaybackForRefresh();
++            }
++        } else if (!filesToDelete.isEmpty()) {
++            // Just deleted some files, refresh playlist
++            stopPlaybackForRefresh();
++            ui.post(() -> toast("Removed " + filesToDelete.size() + " unassigned video(s)"));
++        } else {
++            Log.d(TAG, "All videos are up to date");
++        }
++    }
++
+     private void startBackgroundCheckIfNeeded() {
+         if (isWorking || downloadInProgress) return;
+         isWorking = true;
+         new Thread(() -> {
+             try {
+-                File mainDir = ensureMainDir(), tmpDir = ensureTempDir();
+-                if (!isOnline()) return;
++                File mainDir = ensureMainDir();
++                if (!isOnline()) {
++                    // Offline: just continue playing local videos
++                    return;
++                }
+                 String id = getAndroidId();
+                 if (!readDownloadStatus(readStatusUrl(id))) {
+                     downloadInProgress = true;
+                     try {
+-                        deleteAllInDirectory(tmpDir);
+-                        List<String> urls = fetchDownloadUrls(listDownloadsUrl(id));
+-                        if (!urls.isEmpty() && downloadAllWithResume(urls, tmpDir) == urls.size()) {
+-                            stopPlaybackForRefresh();
+-                            atomicSwapIntoMain(mainDir, tmpDir);
+-                            postUpdateStatusTrue(updateStatusUrl(id));
+-                            ui.post(() -> { toast("Videos refreshed"); playLocalPlaylistOrToast(mainDir); });
+-                        }
++                        // Use smart sync instead of full re-download
++                        smartSyncVideos(mainDir, id);
++                        postUpdateStatusTrue(updateStatusUrl(id));
++                        ui.post(() -> playLocalPlaylistOrToast(mainDir));
+                     } finally { downloadInProgress = false; }
+                 }
+             } catch (Exception ignored) {}
+@@ -612,6 +707,32 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
+         return urls;
+     }
+ 
++    // Returns list of expected filenames from server
++    private List<String> fetchExpectedFilenames(String url) throws Exception {
++        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
++        c.setConnectTimeout(20_000); c.setReadTimeout(30_000); c.setRequestMethod("GET"); c.connect();
++        if (c.getResponseCode() / 100 != 2) { c.disconnect(); return new ArrayList<>(); }
++        StringBuilder sb = new StringBuilder();
++        try (BufferedReader br = new BufferedReader(new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8))) {
++            String line; while ((line = br.readLine()) != null) sb.append(line);
++        } finally { c.disconnect(); }
++        List<String> filenames = new ArrayList<>();
++        JSONArray items = new JSONObject(sb.toString()).optJSONArray("items");
++        if (items != null) for (int i = 0; i < items.length(); i++) {
++            JSONObject item = items.optJSONObject(i);
++            String filename = item.optString("filename", "").trim();
++            if (filename.isEmpty()) {
++                // Extract filename from URL if not provided
++                String urlStr = item.optString("url", "").trim();
++                if (!urlStr.isEmpty()) {
++                    filename = filenameFromUrl(urlStr);
++                }
++            }
++            if (!filename.isEmpty()) filenames.add(filename);
++        }
++        return filenames;
++    }
++
+     private int downloadAllWithResume(List<String> urls, File dir) {
+         if (urls == null || urls.isEmpty()) return 0;
+         ui.post(() -> toast("Downloading " + urls.size() + " video(s)…"));
+@@ -680,22 +801,43 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
+         List<File> files = listMp4(dir);
+         if (files.isEmpty()) { ui.post(() -> toast("No videos found")); return; }
+         currentPlaylistFiles = new ArrayList<>(files);
+-        lastAppliedRotation = -9999;
+-        lastAppliedFitMode = "";
++        
++        // Pre-apply rotation for first video BEFORE resetting
++        VideoMetadata firstVm = getMetadataForFile(files.get(0));
++        int firstRotation = firstVm != null ? firstVm.rotation : 0;
++        String firstFitMode = firstVm != null ? firstVm.fitMode : "cover";
++        lastAppliedRotation = firstRotation;
++        lastAppliedFitMode = firstFitMode;
+ 
+         ui.post(() -> {
+             initPlayer();
+             List<MediaItem> items = new ArrayList<>();
+             for (File f : files) if (f.exists() && f.length() > 0) items.add(MediaItem.fromUri(Uri.fromFile(f)));
+             if (items.isEmpty()) { toast("No playable videos"); return; }
++            
++            // Apply transform BEFORE starting playback to prevent glitch
++            applyTextureViewTransform(firstRotation, firstFitMode);
++            
+             player.setMediaItems(items, true);
+             player.setRepeatMode(Player.REPEAT_MODE_ALL);
+             player.addListener(new Player.Listener() {
+                 @Override
+                 public void onMediaItemTransition(MediaItem m, int r) {
+-                    lastAppliedRotation = -9999;
+-                    lastAppliedFitMode = "";
+-                    applyRotationForCurrentVideo();
++                    // Get next video's rotation BEFORE resetting
++                    int nextIdx = player.getCurrentMediaItemIndex();
++                    if (nextIdx >= 0 && nextIdx < currentPlaylistFiles.size()) {
++                        File nextFile = currentPlaylistFiles.get(nextIdx);
++                        VideoMetadata nextVm = getMetadataForFile(nextFile);
++                        int nextRotation = nextVm != null ? nextVm.rotation : 0;
++                        String nextFitMode = nextVm != null ? nextVm.fitMode : "cover";
++                        
++                        // Apply immediately if different
++                        if (nextRotation != lastAppliedRotation || !nextFitMode.equals(lastAppliedFitMode)) {
++                            lastAppliedRotation = nextRotation;
++                            lastAppliedFitMode = nextFitMode;
++                            applyTextureViewTransform(nextRotation, nextFitMode);
++                        }
++                    }
+                 }
+ 
+                 @Override
+@@ -704,14 +846,11 @@ public class FullScreenPlayerActivity extends AppCompatActivity implements Textu
+                     videoHeight = size.height;
+                     Log.d(TAG, "Video size: " + videoWidth + "x" + videoHeight);
+                     // Re-apply transform with correct video dimensions
+-                    applyRotationForCurrentVideo();
++                    applyTextureViewTransform(lastAppliedRotation, lastAppliedFitMode);
+                 }
+             });
+             player.prepare();
+             player.play();
+-
+-            // Apply initial rotation after a delay
+-            textureView.postDelayed(() -> applyRotationForCurrentVideo(), 500);
+         });
+     }
+ 
